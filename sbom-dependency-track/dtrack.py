@@ -281,13 +281,19 @@ def purl_is_garbage(purl):
 PURL_PLAIN_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-_~:/")
 
 
+# What DT stores per non-ASCII UTF-8 byte. Measured on the real rejection
+# (hotlaps test-runtime, a 226-char nuget purl with a Russian package name):
+# DT reads each UTF-8 byte as a Latin-1 char, re-encodes that to two UTF-8
+# bytes, and writes each as a sign-extended %FFFFFFxx -> 2 x 9 chars.
+DT_CHARS_PER_NON_ASCII_BYTE = 18
+
+
 def projected_purl_length(purl):
-    """Length DT will store: it re-canonicalises the purl and writes every non-ASCII UTF-8 byte as a
-    sign-extended %FFFFFFxx (9 chars), so a short mojibake name can overflow the 1024-char PURLCOORDINATES
-    column. ASCII counts 1 (3 when it needs escaping); percent-escapes are decoded first."""
+    """Length DT will store in the 1024-char PURLCOORDINATES column: non-ASCII bytes cost
+    DT_CHARS_PER_NON_ASCII_BYTE, ASCII 1 (3 when it needs escaping); percent-escapes are decoded first."""
     total = 0
     for byte in urllib.parse.unquote_to_bytes(purl):
-        total += 9 if byte >= 0x80 else 1 if byte in PURL_PLAIN_BYTES else 3
+        total += DT_CHARS_PER_NON_ASCII_BYTE if byte >= 0x80 else 1 if byte in PURL_PLAIN_BYTES else 3
     return total
 
 

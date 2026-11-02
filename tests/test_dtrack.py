@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tarfile
 import threading
+import urllib.parse
 
 import pytest
 
@@ -143,9 +144,22 @@ def test_purl_short_raw_but_too_long_once_dt_reencodes_it_is_dropped(capsys):
         assert "dropped 1 component(s) DT cannot store" in capsys.readouterr().out
 
 
+def test_real_hotlaps_purl_is_dropped():
+    # The purl DT rejected (226 chars raw); it projects to ~1083 under DT's double encoding.
+    name = "Средства Visual Studio для контейнеров — общие"
+    purl = "pkg:nuget/" + urllib.parse.quote(name, safe="") + "@74.1.2509.2501"
+    assert len(purl) < 300 and dtrack.projected_purl_length(purl) > 1024
+    bom = {"bomFormat": "CycloneDX", "components": [
+        {"type": "library", "bom-ref": "ru", "name": name, "version": "74.1.2509.2501", "purl": purl},
+        {"type": "library", "bom-ref": "ok", "name": "Microsoft.VisualStudio.Containers.Tools.Common",
+         "version": "74.1.2509.2501",
+         "purl": "pkg:nuget/Microsoft.VisualStudio.Containers.Tools.Common@74.1.2509.2501"}]}
+    assert [c["bom-ref"] for c in dtrack.slim_bom(bom)["components"]] == ["ok"]
+
+
 def test_short_non_ascii_purls_are_kept_and_projection_counts_bytes():
     assert dtrack.projected_purl_length("pkg:nuget/abc@1.0") == len("pkg:nuget/abc@1.0") + 2  # '@' escapes to 3
-    assert dtrack.projected_purl_length("pkg:nuget/Caf%C3%A9@1") == len("pkg:nuget/Caf") + 2 * 9 + 3 + 1
+    assert dtrack.projected_purl_length("pkg:nuget/Caf%C3%A9@1") == len("pkg:nuget/Caf") + 2 * 18 + 3 + 1
     bom = {"bomFormat": "CycloneDX", "components": [
         {"type": "library", "bom-ref": "ok", "name": "Café", "version": "1", "purl": "pkg:nuget/Caf%C3%A9@1"},
         {"type": "library", "bom-ref": "ok2", "name": "日本語", "version": "1", "purl": "pkg:nuget/日本語@1"}]}
