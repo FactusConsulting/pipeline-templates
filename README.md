@@ -86,27 +86,41 @@ jobs:
 | `parent` | `build/<repo-name>` | Grouping parent; every path prefix is created top-down (`build`, `build/<repo>`). |
 | `fail-on-severity` | empty = report only | `CRITICAL`, `HIGH`, `MEDIUM` or `LOW`: fail on any unsuppressed finding at or above it. |
 | `wait-timeout` | `300` | Seconds to wait for DT to finish processing before the gate gives up (gate only). |
+| `import-wait` | `120` | Report-only mode: seconds to wait for DT to import the BOM before verifying the import (gate mode uses `wait-timeout`). |
 | `attest` | `false` | `true`: `cosign attest --type cyclonedx` the SBOM to the image (keyless, GitHub OIDC). Needs `id-token: write` and an image ref with `@sha256` digest. |
 | `registry` (workflow only) | `ghcr.io` | Registry to log in to with the caller's `GITHUB_TOKEN` (`packages: read`). Empty = no login. |
 | `runs-on` (workflow only) | `'"arc-runner"'` | JSON for `runs-on`. |
 
-Action outputs: `project`, `version`, `sbom-path`, `project-uuid`, `gate`
-(`passed` / `failed` / `unavailable` / `skipped`), `findings-total`, `findings-blocking`.
+| Output | Meaning |
+|---|---|
+| `project`, `version` | DT project name and version used. |
+| `sbom-path` | The slimmed CycloneDX file (empty if generation failed). |
+| `imported` | `true`: DT imported the BOM. `false`: DT did not import it (or nothing was uploaded). `unknown`: DT could not be queried, or was still processing when `import-wait` ran out. |
+| `gate` | `passed` / `failed` / `unavailable` (gate could not be evaluated) / `skipped` (no `fail-on-severity`). |
+| `project-uuid` | DT project uuid, once looked up after the upload. |
+| `findings-total`, `findings-blocking` | Unsuppressed findings / those at or above the floor (gate mode only). |
 
 ## Behaviour
 
 1. Installs a pinned syft (version and sha256 in `dtrack.py`, linux amd64/arm64, checksum-verified) and runs
-   `syft <image> -o cyclonedx-json`. `file` components, per-file evidence and duplicates are dropped, as in the host uploader.
+   `syft <image> -o cyclonedx-json`. `file` components, per-file evidence and duplicates are dropped, as in the host uploader. Components DT cannot
+   store are dropped too (purl over 1024 characters, name/version/group over 255, control characters, or a purl
+   with invalid %-escapes such as `%FFFFFFC3`) with a `dropped N component(s) DT cannot store` warning: one such
+   component makes DT fail the whole import.
 2. Creates the parents `build` and `build/<repo>` with component-less BOM uploads (idempotent; DT only
    applies a parent when it creates a project), then uploads the BOM (`PUT /api/v1/bom`, `autoCreate`).
-3. With `fail-on-severity`: polls `/api/v1/event/token/<token>` until DT finished processing (or
-   `wait-timeout`), reads `/api/v1/finding/project/<uuid>` and fails on any unsuppressed finding at or above
-   the floor. Without it the upload is fire-and-forget (no waiting, the build is never slowed).
+3. Verifies the import in **every** mode: polls `/api/v1/event/token/<token>` (up to `import-wait`, or
+   `wait-timeout` with a gate), looks the project up and checks that `lastBomImport` is set and, if the SBOM had
+   components, that the project has more than 0 components. DT accepts a BOM and imports it asynchronously, so a
+   bad BOM otherwise fails silently. A failed import is a `::warning` and `imported=false` (report-only) or an
+   `::error` and a failed step (gate mode). With `fail-on-severity`, it then reads
+   `/api/v1/finding/project/<uuid>` and fails on any unsuppressed finding at or above the floor. Report-only mode
+   therefore waits up to `import-wait` (default 120 s) for DT, normally a few seconds.
 4. Writes a severity count table and the findings list (worst first, EPSS) to the job summary.
 5. `attest: true`: installs cosign and attests the SBOM to `image@digest`.
 
-Failure policy: **report-only never breaks a build.** A DT outage, bad API key, syft failure or missing
-python3 (the action installs it with `actions/setup-python` when absent) is a `::warning` and the step
+Failure policy: **report-only never breaks a build.** A DT outage (also during the import check), failed
+import, bad API key, syft failure or missing python3 (the action installs it with `actions/setup-python` when absent) is a `::warning` and the step
 succeeds. With `fail-on-severity` set it fails closed with a clear message (the SBOM is still attested first,
 if requested). Invalid inputs always fail. A missing API key (e.g. fork PRs) skips the upload the same way.
 

@@ -40,6 +40,12 @@ inputs:
     description: Seconds to wait for DT to finish processing the BOM before the gate gives up (gate only).
     required: false
     default: '300'
+  import-wait:
+    description: >-
+      Report-only mode: seconds to wait for DT to import the BOM before verifying it (gate mode uses wait-timeout).
+      A failed or unconfirmed import is a warning, never a build failure, unless fail-on-severity is set.
+    required: false
+    default: '120'
   attest:
     description: >-
       'true' = cosign-attest the SBOM to the image (keyless, GitHub OIDC). Needs `id-token: write` and an image
@@ -57,8 +63,13 @@ outputs:
   sbom-path:
     description: Path of the CycloneDX SBOM written (empty when generation failed).
     value: ${{ steps.sbom.outputs.sbom-path }}
+  imported:
+    description: >-
+      true = DT imported the BOM (lastBomImport set, components present); false = DT did not import it, or nothing
+      was uploaded; unknown = DT could not be queried or was still processing when the wait ran out.
+    value: ${{ steps.sbom.outputs.imported }}
   project-uuid:
-    description: DT project uuid (only set when the gate ran).
+    description: DT project uuid (set once the project was looked up after the upload).
     value: ${{ steps.sbom.outputs.project-uuid }}
   gate:
     description: passed | failed | unavailable (gate could not be evaluated) | skipped (no fail-on-severity, or nothing uploaded).
@@ -105,6 +116,7 @@ runs:
         IN_PARENT: ${{ inputs.parent }}
         IN_FAIL_ON: ${{ inputs.fail-on-severity }}
         IN_WAIT: ${{ inputs.wait-timeout }}
+        IN_IMPORT_WAIT: ${{ inputs.import-wait }}
         ACTION_PATH: ${{ github.action_path }}
       run: |
         set +e
@@ -125,6 +137,7 @@ runs:
             --parent "$IN_PARENT" \
             --fail-on-severity "$IN_FAIL_ON" \
             --wait-timeout "$IN_WAIT" \
+            --import-wait "$IN_IMPORT_WAIT" \
             --sbom-out "${RUNNER_TEMP:-/tmp}/sbom-dependency-track.cdx.json"
           rc=$?
         fi

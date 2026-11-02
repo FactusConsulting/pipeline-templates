@@ -38,6 +38,10 @@ on:
         description: Seconds to wait for DT processing (gate only).
         type: string
         default: '300'
+      import-wait:
+        description: Report-only mode - seconds to wait for DT to import the BOM before verifying it.
+        type: string
+        default: '120'
       attest:
         description: cosign-attest the SBOM to the image (needs id-token write and a digest ref).
         type: boolean
@@ -89,4 +93,5 @@ jobs:
           parent: ${{ inputs.parent }}
           fail-on-severity: ${{ inputs.fail-on-severity }}
           wait-timeout: ${{ inputs.wait-timeout }}
+          import-wait: ${{ inputs.import-wait }}
           attest: ${{ inputs.attest }}

@@ -49,7 +49,7 @@ def env(tmp_path, monkeypatch):
 def run_args(dt, fake_syft, env, *extra):
     return parse("--image", "ghcr.io/factusconsulting/hotlaps-api:1.2.3@sha256:" + "a" * 64,
                  "--url", dt.url, "--syft", fake_syft, "--sbom-out", str(env["tmp"] / "sbom.json"),
-                 "--poll-interval", "0.01", "--retry-delay", "0.01", "--parent-wait", "0.3", *extra)
+                 "--poll-interval", "0.01", "--retry-delay", "0.01", "--parent-wait", "0.3", "--import-wait", "5", *extra)
 
 
 def outputs(env):
@@ -113,6 +113,45 @@ def test_slim_bom_drops_files_duplicates_and_bulky_properties():
     assert bom["components"][0]["properties"] == [{"name": "syft:package:type", "value": "deb"}]
     assert bom["dependencies"] == [{"ref": "root", "dependsOn": ["pkg-a"]}]
     assert not any(c["type"] == "file" for c in bom["components"])
+
+
+@pytest.mark.parametrize("purl", [
+    "pkg:nuget/" + "%FFFFFFC3%FFFFFF90" * 5 + "@74.1.2509.2501",   # sign-extended garbage escapes
+    "pkg:nuget/abc%ZZdef@1",                                         # invalid percent escape
+    "pkg:nuget/abc%2@1",                                             # truncated escape
+    "pkg:nuget/ab\x07c@1",                                           # control character
+    "pkg:nuget/" + "a" * 1100 + "@1",                                # over-long
+])
+def test_garbage_purls_are_dropped(purl, capsys):
+    bom = {"bomFormat": "CycloneDX", "components": [
+        {"type": "library", "bom-ref": "ok", "name": "fine", "version": "1", "purl": "pkg:nuget/Fine%C3%A9@1"},
+        {"type": "library", "bom-ref": "bad", "name": "x", "version": "1", "purl": purl}]}
+    assert [c["bom-ref"] for c in dtrack.slim_bom(bom)["components"]] == ["ok"]
+    out = capsys.readouterr().out
+    assert "::warning" in out and "dropped 1 component(s) DT cannot store" in out
+    assert len(out) < 600  # the example is truncated
+
+
+def test_dropped_example_is_truncated_to_120_chars(capsys):
+    bom = {"bomFormat": "CycloneDX", "components": [
+        {"type": "library", "bom-ref": "bad", "name": "x", "purl": "pkg:nuget/" + "a" * 2000 + "@1"}]}
+    dtrack.slim_bom(bom)
+    out = capsys.readouterr().out
+    assert "a" * 100 in out and "a" * 121 not in out
+
+
+def test_slim_bom_drops_components_dt_cannot_store(capsys):
+    bom = json.loads(json.dumps(FAKE_BOM))
+    bom["components"] += [
+        {"type": "library", "bom-ref": "bad-purl", "name": "x", "version": "74.1.2509.2501",
+         "purl": "pkg:nuget/" + "%FFFFFFC3%FFFFFF90" * 80 + "@74.1.2509.2501"},
+        {"type": "library", "bom-ref": "bad-name", "name": "n" * 256, "version": "1"},
+    ]
+    bom["dependencies"].append({"ref": "bad-purl", "dependsOn": []})
+    slim = dtrack.slim_bom(bom)
+    assert [c["bom-ref"] for c in slim["components"]] == ["pkg-a"]
+    assert all(d["ref"] != "bad-purl" for d in slim["dependencies"])
+    assert "dropped 2 component(s) DT cannot store" in capsys.readouterr().out
 
 
 # ── syft install ─────────────────────────────────────────────────────────────
@@ -207,14 +246,15 @@ def test_upload_order_body_and_key_header(dt, fake_syft, env, capsys):
 
     # parents were processed (token polled) before the project upload
     kinds = ["PUT" if r[0] == "PUT" else "poll" for r in dt.requests]
-    assert kinds[0] == "PUT" and kinds[-1] == "PUT" and kinds.count("PUT") == 3
+    assert kinds[0] == "PUT" and kinds.count("PUT") == 3
+    assert kinds[-1] == "poll"  # the image import is verified even in report-only mode
     assert all(k == "poll" for k in kinds[1:kinds.index("PUT", 1)])  # first parent polled before the next upload
     assert kinds[kinds.index("PUT", 1) + 1] == "poll"                 # ...and so was the second
     out = capsys.readouterr()
     assert API_KEY not in out.out + out.err
     assert API_KEY not in env["summary"].read_text() + env["output"].read_text()
     o = outputs(env)
-    assert o["gate"] == "skipped" and o["project"] == "build/hotlaps/hotlaps-api"
+    assert o["gate"] == "skipped" and o["project"] == "build/hotlaps/hotlaps-api" and o["imported"] == "true"
     assert json.loads(open(o["sbom-path"]).read())["components"][0]["name"] == "openssl"
 
 
@@ -398,3 +438,75 @@ def test_wait_timeout_accepts_seconds_suffix(env):
 def test_digest_ref_output_for_attestation(dt, fake_syft, env):
     assert dtrack.run(run_args(dt, fake_syft, env)) == 0
     assert outputs(env)["image-digest-ref"] == "ghcr.io/factusconsulting/hotlaps-api@sha256:" + "a" * 64
+
+
+# ── import verification ──────────────────────────────────────────────────────
+
+
+def test_failed_import_warns_in_report_only_mode(dt, fake_syft, env, capsys):
+    dt.last_bom_import = None
+    dt.component_total = 0
+    assert dtrack.run(run_args(dt, fake_syft, env)) == 0
+    out = capsys.readouterr().out
+    assert "::warning" in out and "DT did not import the BOM" in out and "lastBomImport" in out
+    o = outputs(env)
+    assert o["imported"] == "false" and o["gate"] == "skipped"
+    assert "NOT imported" in env["summary"].read_text()
+
+
+def test_zero_components_despite_import_timestamp_warns(dt, fake_syft, env, capsys):
+    dt.component_total = 0
+    assert dtrack.run(run_args(dt, fake_syft, env)) == 0
+    assert "has 0 components but the SBOM had 1" in capsys.readouterr().out
+    assert outputs(env)["imported"] == "false"
+    assert any(r[1] == "/api/v1/component/project/uuid-1" and r[2]["pageSize"] == "1" for r in dt.requests)
+
+
+def test_failed_import_fails_the_gate(dt, fake_syft, env, capsys):
+    dt.last_bom_import = None
+    dt.component_total = 0
+    assert dtrack.run(run_args(dt, fake_syft, env, "--fail-on-severity", "HIGH")) == 1
+    out = capsys.readouterr().out
+    assert "::error" in out and "DT did not import the BOM" in out and "failing closed" in out
+    assert outputs(env)["imported"] == "false"
+    assert not any(r[1].startswith("/api/v1/finding") for r in dt.requests)
+
+
+def test_empty_bom_only_needs_an_import_timestamp(dt, env, tmp_path):
+    empty = tmp_path / "empty-syft"
+    empty.write_text("#!%s\nimport sys, json\nout = sys.argv[sys.argv.index('-o') + 1].split('=', 1)[1]\n"
+                     "json.dump({'bomFormat': 'CycloneDX', 'components': []}, open(out, 'w'))\n" % sys.executable)
+    empty.chmod(0o755)
+    dt.component_total = 0
+    args = parse("--image", "app:1", "--url", dt.url, "--syft", str(empty), "--sbom-out", str(env["tmp"] / "s.json"),
+                 "--poll-interval", "0.01", "--parent-wait", "0.3")
+    assert dtrack.run(args) == 0
+    assert outputs(env)["imported"] == "true"
+    assert not any(r[1].startswith("/api/v1/component") for r in dt.requests)
+
+
+def test_import_wait_timeout_is_unknown_not_failure(dt, fake_syft, env, capsys):
+    dt.processing_polls = 10 ** 9
+    assert dtrack.run(run_args(dt, fake_syft, env, "--import-wait", "0.2")) == 0
+    out = capsys.readouterr().out
+    assert "::warning" in out and "could not confirm DT imported the BOM" in out
+    assert outputs(env)["imported"] == "unknown"
+
+
+def test_dt_outage_during_import_check_stays_a_warning(dt, fake_syft, env, capsys):
+    dt.token_status = 503
+    assert dtrack.run(run_args(dt, fake_syft, env, "--import-wait", "0.2")) == 0
+    assert "could not confirm DT imported the BOM" in capsys.readouterr().out
+    assert outputs(env)["imported"] == "unknown"
+
+
+def test_not_uploaded_means_not_imported(dt, fake_syft, env):
+    dt.fail_put = (503, "down")
+    assert dtrack.run(run_args(dt, fake_syft, env)) == 0
+    assert outputs(env)["imported"] == "false"
+
+
+def test_import_wait_accepts_seconds_suffix_and_rejects_garbage(env):
+    assert dtrack.resolve_settings(parse("--image", "a:1", "--import-wait", "90s"), os.environ)["import_wait"] == 90.0
+    with pytest.raises(dtrack.ConfigError):
+        dtrack.resolve_settings(parse("--image", "a:1", "--import-wait", "-1"), os.environ)

@@ -43,6 +43,8 @@ class StubDT:
         self.page_size_cap = None
         self.fail_put = None        # (status, body) returned for every PUT /bom
         self.token_status = 200
+        self.last_bom_import = 1700000000000   # None = DT never imported the BOM
+        self.component_total = 1
         self.polls = 0
         stub = self
 
@@ -78,7 +80,12 @@ class StubDT:
                         return self._send(stub.token_status, {"error": "nope"})
                     return self._send(200, {"processing": stub.polls <= stub.processing_polls})
                 if parsed.path == "/api/v1/project/lookup":
-                    return self._send(200, {"uuid": "uuid-1", "name": query.get("name")})
+                    return self._send(200, {"uuid": "uuid-1", "name": query.get("name"),
+                                            "version": query.get("version"),
+                                            "lastBomImport": stub.last_bom_import})
+                if parsed.path == "/api/v1/component/project/uuid-1":
+                    return self._send(200, [{"name": "c"}] * min(stub.component_total, 1),
+                                      headers={"X-Total-Count": str(stub.component_total)})
                 if parsed.path == "/api/v1/finding/project/uuid-1":
                     size = int(query.get("pageSize", 100))
                     if stub.page_size_cap:

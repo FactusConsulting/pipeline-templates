@@ -61,6 +61,10 @@ BULKY_PROPERTY_PREFIXES = ("syft:location", "syft:metadata", "syft:file")
 IMAGE_SCHEMES = ("docker", "podman", "containerd", "registry", "docker-archive",
                  "oci-archive", "oci-dir", "singularity", "dir", "file")
 SUMMARY_ROWS = 50
+# DT column limits (Component table): one over-long value makes the whole BOM import fail
+# terminally ("value ... in column PURLCOORDINATES that has maximum length of 1024").
+MAX_PURL = 1024
+MAX_FIELD = 255
 
 
 class ConfigError(Exception):
@@ -73,6 +77,12 @@ class SoftError(Exception):
 
 def log(message):
     print("sbom-dependency-track: %s" % message, flush=True)
+
+
+def annotate(level, message):
+    """GitHub workflow-command annotation (data escaped as the runner expects)."""
+    data = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print("::%s title=SBOM -> Dependency-Track::%s" % (level, data), flush=True)
 
 
 # ── Inputs ───────────────────────────────────────────────────────────────────
@@ -103,6 +113,18 @@ def image_basename(ref):
     return name
 
 
+def parse_seconds(value, name, minimum_exclusive=None):
+    """'120' or '120s' -> 120.0; finite, >= 0 (or > minimum_exclusive)."""
+    try:
+        seconds = float(str(value).strip().rstrip("sS"))
+    except (TypeError, ValueError):
+        raise ConfigError("%s must be a number of seconds, got %r" % (name, value)) from None
+    if not seconds >= 0 or seconds == float("inf") or (minimum_exclusive is not None and seconds <= minimum_exclusive):
+        raise ConfigError("%s must be a finite number of seconds%s, got %r" % (
+            name, " greater than 0" if minimum_exclusive is not None else " >= 0", value))
+    return seconds
+
+
 def resolve_settings(args, environ):
     image = (args.image or "").strip()
     if not image:
@@ -111,12 +133,8 @@ def resolve_settings(args, environ):
     if floor and floor not in GATE_FLOORS:
         raise ConfigError("fail-on-severity must be one of %s (or empty), got %r" % (
             ", ".join(GATE_FLOORS), args.fail_on_severity))
-    try:
-        wait_timeout = float(str(args.wait_timeout).strip().rstrip("sS"))
-    except (TypeError, ValueError):
-        raise ConfigError("wait-timeout must be a number of seconds, got %r" % args.wait_timeout) from None
-    if not wait_timeout > 0 or wait_timeout == float("inf"):
-        raise ConfigError("wait-timeout must be positive")
+    wait_timeout = parse_seconds(args.wait_timeout, "wait-timeout", minimum_exclusive=0)
+    import_wait = parse_seconds(args.import_wait, "import-wait")
 
     repo_full = (args.repo or environ.get("GITHUB_REPOSITORY") or "").strip()
     repo = repo_full.rsplit("/", 1)[-1]
@@ -152,6 +170,7 @@ def resolve_settings(args, environ):
         "url": url,
         "floor": floor,
         "wait_timeout": wait_timeout,
+        "import_wait": import_wait,
         "sbom_out": args.sbom_out,
         "syft": args.syft,
         "syft_dir": args.syft_dir,
@@ -243,12 +262,42 @@ def component_identity(component):
         component.get("type"), component.get("group"), component.get("name"), component.get("version"))
 
 
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+BAD_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+
+
+def purl_is_garbage(purl):
+    """Control characters, truncated %-escapes, or escapes that do not decode to UTF-8 (e.g. %FFFFFFC3)."""
+    if CONTROL_CHARS.search(purl) or BAD_PERCENT_ESCAPE.search(purl):
+        return True
+    try:
+        urllib.parse.unquote_to_bytes(purl).decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
+def exceeds_dt_limits(component):
+    """True if DT cannot store the component (garbage names from binary scanning, e.g. mojibake nuget ids)."""
+    purl = str(component.get("purl") or "")
+    if len(purl) > MAX_PURL or purl_is_garbage(purl):
+        return True
+    for key in ("name", "version", "group"):
+        value = str(component.get(key) or "")
+        if len(value) > MAX_FIELD or CONTROL_CHARS.search(value):
+            return True
+    return False
+
+
 def slim_bom(bom):
-    """Drop `file` components, evidence, bulky syft properties and duplicates."""
+    """Drop `file` components, evidence, bulky syft properties, duplicates and components DT cannot store."""
     components = bom.get("components") or []
-    kept, seen, refs = [], set(), set()
+    kept, seen, refs, oversized = [], set(), set(), []
     for component in components:
         if component.get("type") == "file":
+            continue
+        if exceeds_dt_limits(component):
+            oversized.append(component)
             continue
         identity = component_identity(component)
         if identity in seen:
@@ -273,6 +322,10 @@ def slim_bom(bom):
             dict(entry, dependsOn=[r for r in entry.get("dependsOn") or [] if r in refs])
             for entry in bom.get("dependencies") or [] if entry.get("ref") in refs]
     log("slimmed BOM: %d -> %d component(s)" % (len(components), len(kept)))
+    if oversized:
+        example = str(oversized[0].get("purl") or oversized[0].get("name") or "")[:120]
+        annotate("warning", "dropped %d component(s) DT cannot store (over-long or malformed purl/name/version; "
+                 "one would fail the whole import), e.g. %r" % (len(oversized), example))
     return bom
 
 
@@ -377,12 +430,19 @@ class DTrack:
                 raise SoftError("DT was still processing the BOM after %gs" % timeout)
             time.sleep(interval)
 
-    def lookup(self, name, version):
+    def project(self, name, version):
         _, _, payload = self.request("GET", "/api/v1/project/lookup", query={"name": name, "version": version})
-        project = (payload or {}).get("uuid")
-        if not project:
+        if not (payload or {}).get("uuid"):
             raise SoftError("project %s/%s not found in DT after upload" % (name, version))
-        return project
+        return payload
+
+    def component_count(self, project_uuid):
+        _, headers, payload = self.request("GET", "/api/v1/component/project/%s" % project_uuid,
+                                           query={"pageSize": 1, "pageNumber": 1})
+        try:
+            return int(headers.get("X-Total-Count"))
+        except (TypeError, ValueError):
+            return len(payload or [])
 
     def findings(self, project_uuid, page_size=100):
         found, page = [], 1
@@ -493,8 +553,26 @@ def set_outputs(**values):
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 
+class ImportFailed(SoftError):
+    """DT accepted the upload but did not import the BOM."""
+
+
+def verify_import(client, project, expected_components):
+    """The project must have a BOM import and, if the BOM had components, a non-zero component count."""
+    if not project.get("lastBomImport"):
+        raise ImportFailed("DT did not import the BOM: project %s/%s has no BOM import (lastBomImport is null); "
+                           "check the DT API server log for the ImportBomActivity error" % (
+                               project.get("name"), project.get("version")))
+    if expected_components:
+        count = client.component_count(project["uuid"])
+        if count == 0:
+            raise ImportFailed("DT did not import the BOM: project %s/%s has 0 components but the SBOM had %d; "
+                               "check the DT API server log for the ImportBomActivity error" % (
+                                   project.get("name"), project.get("version"), expected_components))
+
+
 def execute(settings, api_key, outputs):
-    """Run the pipeline. Fills `outputs`; returns (status, findings, blocking)."""
+    """Run the pipeline. Fills `outputs`; returns (status, findings, blocking, warning)."""
     syft = settings["syft"]
     if not syft:
         syft_dir = settings["syft_dir"] or os.path.join(
@@ -515,15 +593,32 @@ def execute(settings, api_key, outputs):
     token = client.upload(settings["project"], settings["version"], bom, tags=settings["tags"],
                           parent=settings["parent"])
     outputs["token"] = token
-    if not settings["floor"]:
-        return "uploaded (token %s); no vulnerability gate" % token, None, []
+    floor = settings["floor"]
 
-    client.wait(token, settings["wait_timeout"], settings["poll_interval"])
-    project_uuid = client.lookup(settings["project"], settings["version"])
-    outputs["project_uuid"] = project_uuid
-    findings = client.findings(project_uuid)
-    blocking = blocking_findings(findings, settings["floor"])
-    return "processed", findings, blocking
+    # Verify the import in every mode: DT accepts the upload and fails the import later, silently.
+    try:
+        client.wait(token, settings["wait_timeout"] if floor else settings["import_wait"], settings["poll_interval"])
+        project = client.project(settings["project"], settings["version"])
+        outputs["project_uuid"] = project["uuid"]
+        verify_import(client, project, len(bom["components"]))
+        outputs["imported"] = "true"
+    except ImportFailed as error:
+        outputs["imported"] = "false"
+        if floor:
+            raise
+        return "uploaded, NOT imported (token %s)" % token, None, [], str(error)
+    except SoftError as error:
+        outputs["imported"] = "unknown"
+        if floor:
+            raise
+        return "uploaded (token %s); import not confirmed" % token, None, [], "could not confirm DT imported the BOM: %s" % error
+
+    if not floor:
+        return "uploaded and imported (token %s); no vulnerability gate" % token, None, [], ""
+
+    findings = client.findings(project["uuid"])
+    blocking = blocking_findings(findings, floor)
+    return "processed", findings, blocking, ""
 
 
 def run(args, environ=None):
@@ -541,8 +636,11 @@ def run(args, environ=None):
 
     def finish(rc, status, gate, level=None, message=""):
         outputs["gate"] = gate
+        if "token" in outputs:
+            outputs.setdefault("imported", "unknown")
+        outputs.setdefault("imported", "false")
         if message:
-            print("::%s title=SBOM -> Dependency-Track::%s" % (level, message.replace("\n", " ")), flush=True)
+            annotate(level, message)
             log(message)
         append_file("GITHUB_STEP_SUMMARY", render_summary(settings, status, findings))
         outputs["findings_total"] = len(active_findings(findings)) if findings is not None else ""
@@ -558,7 +656,7 @@ def run(args, environ=None):
         return finish(0, "skipped: no API key", "skipped", "warning", message)
 
     try:
-        status, findings, blocking = execute(settings, api_key, outputs)
+        status, findings, blocking, warning = execute(settings, api_key, outputs)
     except SoftError as error:
         message = str(error)
         if floor:
@@ -568,7 +666,7 @@ def run(args, environ=None):
                       "%s; the build is not affected (no fail-on-severity set)" % message)
 
     if not floor:
-        return finish(0, status, "skipped")
+        return finish(0, status, "skipped", "warning" if warning else None, warning)
     if blocking:
         worst = ", ".join("%s (%s)" % ((f.get("vulnerability") or {}).get("vulnId"), severity_of(f))
                           for f in sorted(blocking, key=finding_sort_key)[:5])
@@ -592,6 +690,9 @@ def build_parser():
     r.add_argument("--tag", action="append", help="project tag (repeatable; default: build)")
     r.add_argument("--fail-on-severity", default="")
     r.add_argument("--wait-timeout", default="300")
+    r.add_argument("--import-wait", default="120",
+                   help="report-only mode: seconds to wait for DT to import the BOM before checking (gate mode "
+                        "uses --wait-timeout)")
     r.add_argument("--sbom-out", default="sbom.cdx.json")
     r.add_argument("--syft", default="", help="use this syft instead of the pinned download")
     r.add_argument("--syft-dir", default="", help="where to cache the downloaded syft")
