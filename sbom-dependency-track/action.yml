@@ -1,0 +1,169 @@
+name: SBOM to Dependency-Track
+description: >-
+  Generate a CycloneDX SBOM for a container image with syft, upload it to Dependency-Track
+  (build/<repo>/<image>), optionally fail the build on vulnerabilities and attest the SBOM with cosign.
+
+inputs:
+  image:
+    description: >-
+      Image to inventory: a registry ref (ideally with @sha256 digest, then the pushed manifest is scanned)
+      or a local docker image name.
+    required: true
+  project:
+    description: DT project name. Default build/<repo-name>/<image basename>.
+    required: false
+    default: ''
+  version:
+    description: DT project version. Default the image tag, else the short git sha.
+    required: false
+    default: ''
+  dtrack-url:
+    description: >-
+      Dependency-Track API base URL. Default is the in-cluster service; restricted ARC runners cannot reach
+      dtrack.lwa.dk (192.168.0.0/16).
+    required: false
+    default: 'http://dependency-track-api-server.dependency-track.svc.cluster.local:8080'
+  dtrack-api-key:
+    description: DT API key (BOM_UPLOAD, PROJECT_CREATION_UPLOAD; VIEW_VULNERABILITY for the gate). Pass a secret.
+    required: true
+  parent:
+    description: Grouping parent project path, created on demand. Default build/<repo-name>.
+    required: false
+    default: ''
+  fail-on-severity:
+    description: >-
+      Fail the build on any unsuppressed finding at or above this severity (CRITICAL, HIGH, MEDIUM, LOW).
+      Empty = report only: upload, never wait, never fail on DT problems. When set, a DT outage fails the build too.
+    required: false
+    default: ''
+  wait-timeout:
+    description: Seconds to wait for DT to finish processing the BOM before the gate gives up (gate only).
+    required: false
+    default: '300'
+  attest:
+    description: >-
+      'true' = cosign-attest the SBOM to the image (keyless, GitHub OIDC). Needs `id-token: write` and an image
+      ref with @sha256 digest.
+    required: false
+    default: 'false'
+
+outputs:
+  project:
+    description: DT project name used.
+    value: ${{ steps.sbom.outputs.project }}
+  version:
+    description: DT project version used.
+    value: ${{ steps.sbom.outputs.version }}
+  sbom-path:
+    description: Path of the CycloneDX SBOM written (empty when generation failed).
+    value: ${{ steps.sbom.outputs.sbom-path }}
+  project-uuid:
+    description: DT project uuid (only set when the gate ran).
+    value: ${{ steps.sbom.outputs.project-uuid }}
+  gate:
+    description: passed | failed | unavailable (gate could not be evaluated) | skipped (no fail-on-severity, or nothing uploaded).
+    value: ${{ steps.sbom.outputs.gate }}
+  findings-total:
+    description: Unsuppressed findings (only set when the gate ran).
+    value: ${{ steps.sbom.outputs.findings-total }}
+  findings-blocking:
+    description: Unsuppressed findings at or above fail-on-severity (only set when the gate ran).
+    value: ${{ steps.sbom.outputs.findings-blocking }}
+
+runs:
+  using: composite
+  steps:
+    - name: Mask API key
+      shell: bash
+      env:
+        DTRACK_API_KEY: ${{ inputs.dtrack-api-key }}
+      run: |
+        if [ -n "$DTRACK_API_KEY" ]; then echo "::add-mask::$DTRACK_API_KEY"; fi
+
+    - name: Check for python3
+      id: py
+      shell: bash
+      run: |
+        if command -v python3 >/dev/null 2>&1; then echo "found=true" >> "$GITHUB_OUTPUT"; else echo "found=false" >> "$GITHUB_OUTPUT"; fi
+
+    - name: Set up python3
+      if: steps.py.outputs.found != 'true'
+      continue-on-error: true
+      uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      with:
+        python-version: '3.12'
+
+    - name: Generate SBOM and upload to Dependency-Track
+      id: sbom
+      shell: bash
+      env:
+        DTRACK_API_KEY: ${{ inputs.dtrack-api-key }}
+        IN_IMAGE: ${{ inputs.image }}
+        IN_PROJECT: ${{ inputs.project }}
+        IN_VERSION: ${{ inputs.version }}
+        IN_URL: ${{ inputs.dtrack-url }}
+        IN_PARENT: ${{ inputs.parent }}
+        IN_FAIL_ON: ${{ inputs.fail-on-severity }}
+        IN_WAIT: ${{ inputs.wait-timeout }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set +e
+        if ! command -v python3 >/dev/null 2>&1; then
+          if [ -n "$IN_FAIL_ON" ]; then
+            echo "::error title=SBOM -> Dependency-Track::python3 is not available on this runner; failing closed because fail-on-severity=$IN_FAIL_ON"
+            rc=1
+          else
+            echo "::warning title=SBOM -> Dependency-Track::python3 is not available on this runner; no SBOM uploaded (build not affected)"
+            rc=0
+          fi
+        else
+          python3 "$ACTION_PATH/dtrack.py" run \
+            --image "$IN_IMAGE" \
+            --project "$IN_PROJECT" \
+            --version "$IN_VERSION" \
+            --url "$IN_URL" \
+            --parent "$IN_PARENT" \
+            --fail-on-severity "$IN_FAIL_ON" \
+            --wait-timeout "$IN_WAIT" \
+            --sbom-out "${RUNNER_TEMP:-/tmp}/sbom-dependency-track.cdx.json"
+          rc=$?
+        fi
+        # Defer the failure so the optional attestation still runs; the last step enforces it.
+        echo "exit-code=$rc" >> "$GITHUB_OUTPUT"
+
+    - name: Check attestation prerequisites
+      if: inputs.attest == 'true' && steps.sbom.outputs.sbom-path != ''
+      shell: bash
+      env:
+        DIGEST_REF: ${{ steps.sbom.outputs.image-digest-ref }}
+      run: |
+        if [ -z "$DIGEST_REF" ]; then
+          echo "::error title=SBOM attestation::attest=true needs an image ref with an @sha256 digest (pass the pushed image, e.g. \"\$image@\$digest\")"
+          exit 1
+        fi
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "::error title=SBOM attestation::keyless signing needs the job permission 'id-token: write'"
+          exit 1
+        fi
+
+    - name: Install cosign
+      if: inputs.attest == 'true' && steps.sbom.outputs.sbom-path != ''
+      uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+    - name: Attest SBOM to the image
+      if: inputs.attest == 'true' && steps.sbom.outputs.sbom-path != ''
+      shell: bash
+      env:
+        DIGEST_REF: ${{ steps.sbom.outputs.image-digest-ref }}
+        SBOM_PATH: ${{ steps.sbom.outputs.sbom-path }}
+      run: |
+        cosign attest --yes --type cyclonedx --predicate "$SBOM_PATH" "$DIGEST_REF"
+
+    - name: Enforce result
+      if: steps.sbom.outputs.exit-code != '0'
+      shell: bash
+      env:
+        RC: ${{ steps.sbom.outputs.exit-code }}
+      run: |
+        echo "SBOM step reported a failure (see the annotation and job summary above); exit code $RC"
+        exit "$RC"

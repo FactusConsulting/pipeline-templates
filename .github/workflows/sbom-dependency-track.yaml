@@ -1,0 +1,92 @@
+name: SBOM to Dependency-Track
+
+# Reusable workflow: SBOM + Dependency-Track upload as a separate job, for callers that
+# push an image in one job and want the inventory (and optional gate) in another.
+# Inside the build job, prefer the composite action `sbom-dependency-track` directly.
+#
+# The caller must grant the job's token at least `contents: read` and `packages: read`
+# (ghcr login), plus `id-token: write` when `attest: true`.
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Image ref to inventory, ideally with @sha256 digest.
+        type: string
+        required: true
+      project:
+        description: DT project name. Default build/<repo-name>/<image basename>.
+        type: string
+        default: ''
+      version:
+        description: DT project version. Default the image tag, else the short git sha.
+        type: string
+        default: ''
+      dtrack-url:
+        description: DT API base URL. Default is the in-cluster service.
+        type: string
+        default: 'http://dependency-track-api-server.dependency-track.svc.cluster.local:8080'
+      parent:
+        description: Grouping parent project path. Default build/<repo-name>.
+        type: string
+        default: ''
+      fail-on-severity:
+        description: CRITICAL, HIGH, MEDIUM or LOW to fail on unsuppressed findings at/above it; empty = report only.
+        type: string
+        default: ''
+      wait-timeout:
+        description: Seconds to wait for DT processing (gate only).
+        type: string
+        default: '300'
+      attest:
+        description: cosign-attest the SBOM to the image (needs id-token write and a digest ref).
+        type: boolean
+        default: false
+      registry:
+        description: Registry to log in to with the caller's GITHUB_TOKEN so the image can be read. Empty = no login.
+        type: string
+        default: ghcr.io
+      runs-on:
+        description: 'JSON for runs-on, e.g. "arc-runner" or ["self-hosted","arc-runner-hotlaps"].'
+        type: string
+        default: '"arc-runner"'
+    secrets:
+      DTRACK_API_KEY:
+        description: Dependency-Track API key.
+        required: true
+
+jobs:
+  sbom:
+    name: SBOM to Dependency-Track
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    steps:
+      - name: Registry login
+        if: inputs.registry != ''
+        shell: bash
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          # Plain docker config (no docker CLI needed): read by syft and cosign alike.
+          config_dir="$RUNNER_TEMP/sbom-docker-config"
+          mkdir -p "$config_dir"
+          chmod 700 "$config_dir"
+          auth="$(printf '%s:%s' "$REGISTRY_USER" "$REGISTRY_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          printf '{"auths":{"%s":{"auth":"%s"}}}\n' "$REGISTRY" "$auth" > "$config_dir/config.json"
+          echo "DOCKER_CONFIG=$config_dir" >> "$GITHUB_ENV"
+
+      - name: SBOM to Dependency-Track
+        # Same repo, moving major tag: callers on @v1 get matching action fixes.
+        uses: FactusConsulting/pipeline-templates/sbom-dependency-track@v1
+        with:
+          image: ${{ inputs.image }}
+          project: ${{ inputs.project }}
+          version: ${{ inputs.version }}
+          dtrack-url: ${{ inputs.dtrack-url }}
+          dtrack-api-key: ${{ secrets.DTRACK_API_KEY }}
+          parent: ${{ inputs.parent }}
+          fail-on-severity: ${{ inputs.fail-on-severity }}
+          wait-timeout: ${{ inputs.wait-timeout }}
+          attest: ${{ inputs.attest }}
