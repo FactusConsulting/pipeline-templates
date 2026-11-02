@@ -104,8 +104,9 @@ jobs:
 
 1. Installs a pinned syft (version and sha256 in `dtrack.py`, linux amd64/arm64, checksum-verified) and runs
    `syft <image> -o cyclonedx-json`. `file` components, per-file evidence and duplicates are dropped, as in the host uploader. Components DT cannot
-   store are dropped too (purl over 1024 characters, name/version/group over 255, control characters, or a purl
-   with invalid %-escapes such as `%FFFFFFC3`) with a `dropped N component(s) DT cannot store` warning: one such
+   store are dropped too (name/version/group over 255 characters, control characters, a purl with invalid %-escapes such as
+   `%FFFFFFC3`, or a purl whose *projected* stored length exceeds 1024: DT re-encodes every non-ASCII byte as a
+   9-character `%FFFFFFxx`, so a short mojibake name can overflow the column; short legitimate non-ASCII names are kept) with a `dropped N component(s) DT cannot store` warning: one such
    component makes DT fail the whole import.
 2. Creates the parents `build` and `build/<repo>` with component-less BOM uploads (idempotent; DT only
    applies a parent when it creates a project), then uploads the BOM (`PUT /api/v1/bom`, `autoCreate`).

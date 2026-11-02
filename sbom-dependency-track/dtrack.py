@@ -277,10 +277,24 @@ def purl_is_garbage(purl):
     return False
 
 
+# Bytes DT's packageurl re-encoding leaves alone; any other ASCII byte becomes %XX (3 chars).
+PURL_PLAIN_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-_~:/")
+
+
+def projected_purl_length(purl):
+    """Length DT will store: it re-canonicalises the purl and writes every non-ASCII UTF-8 byte as a
+    sign-extended %FFFFFFxx (9 chars), so a short mojibake name can overflow the 1024-char PURLCOORDINATES
+    column. ASCII counts 1 (3 when it needs escaping); percent-escapes are decoded first."""
+    total = 0
+    for byte in urllib.parse.unquote_to_bytes(purl):
+        total += 9 if byte >= 0x80 else 1 if byte in PURL_PLAIN_BYTES else 3
+    return total
+
+
 def exceeds_dt_limits(component):
     """True if DT cannot store the component (garbage names from binary scanning, e.g. mojibake nuget ids)."""
     purl = str(component.get("purl") or "")
-    if len(purl) > MAX_PURL or purl_is_garbage(purl):
+    if len(purl) > MAX_PURL or purl_is_garbage(purl) or projected_purl_length(purl) > MAX_PURL:
         return True
     for key in ("name", "version", "group"):
         value = str(component.get(key) or "")

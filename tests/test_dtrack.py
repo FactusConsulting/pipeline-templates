@@ -132,6 +132,26 @@ def test_garbage_purls_are_dropped(purl, capsys):
     assert len(out) < 600  # the example is truncated
 
 
+def test_purl_short_raw_but_too_long_once_dt_reencodes_it_is_dropped(capsys):
+    # Like the hotlaps test-runtime nuget component: valid UTF-8 mojibake, < 1024 chars raw,
+    # but DT stores every non-ASCII byte as %FFFFFFxx (9 chars) and overflows the column.
+    for purl in ("pkg:nuget/" + "%C3%90" * 150 + "@74.1.2509.2501", "pkg:nuget/" + "Ð" * 150 + "@74.1.2509.2501"):
+        assert len(purl) < 1024 < dtrack.projected_purl_length(purl)
+        bom = {"bomFormat": "CycloneDX", "components": [
+            {"type": "library", "bom-ref": "bad", "name": "Ð" * 150, "version": "74.1.2509.2501", "purl": purl}]}
+        assert dtrack.slim_bom(bom)["components"] == []
+        assert "dropped 1 component(s) DT cannot store" in capsys.readouterr().out
+
+
+def test_short_non_ascii_purls_are_kept_and_projection_counts_bytes():
+    assert dtrack.projected_purl_length("pkg:nuget/abc@1.0") == len("pkg:nuget/abc@1.0") + 2  # '@' escapes to 3
+    assert dtrack.projected_purl_length("pkg:nuget/Caf%C3%A9@1") == len("pkg:nuget/Caf") + 2 * 9 + 3 + 1
+    bom = {"bomFormat": "CycloneDX", "components": [
+        {"type": "library", "bom-ref": "ok", "name": "Café", "version": "1", "purl": "pkg:nuget/Caf%C3%A9@1"},
+        {"type": "library", "bom-ref": "ok2", "name": "日本語", "version": "1", "purl": "pkg:nuget/日本語@1"}]}
+    assert [c["bom-ref"] for c in dtrack.slim_bom(bom)["components"]] == ["ok", "ok2"]
+
+
 def test_dropped_example_is_truncated_to_120_chars(capsys):
     bom = {"bomFormat": "CycloneDX", "components": [
         {"type": "library", "bom-ref": "bad", "name": "x", "purl": "pkg:nuget/" + "a" * 2000 + "@1"}]}
